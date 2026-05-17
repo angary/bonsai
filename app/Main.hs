@@ -43,6 +43,7 @@ run branch paths = do
     commitSha     <- createCommit treeSha
     createBranch branch commitSha
     push branch
+    restoreFiles expandedPaths
     putStrLn $ "pushed branch: " ++ branch
 
 
@@ -129,5 +130,12 @@ push :: String -> IO ()
 push branch = do
     (code, stdout, stderr) <- readProcessWithExitCode "git" ["push", "origin", branch] ""
     putStr stdout
+    putStr stderr
+    when (code /= ExitSuccess) exitFailure
+
+
+restoreFiles :: [String] -> IO ()
+restoreFiles paths = do
+    (code, _, stderr) <- readProcessWithExitCode "git" (["checkout", "HEAD", "--"] ++ paths) ""
     putStr stderr
     when (code /= ExitSuccess) exitFailure

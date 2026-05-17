@@ -1,17 +1,33 @@
-import Control.Monad (when)
-import Data.List (partition)
+import Control.Monad (when, foldM)
+import Data.List (partition, sortBy)
+import Data.Ord (comparing, Down(..))
+import Data.Map (Map)
+import qualified Data.Map as Map
 import System.Directory (doesDirectoryExist, listDirectory, removeFile)
 import System.Exit (ExitCode(..), exitFailure)
 import System.Environment (getArgs)
+import System.FilePath (takeDirectory, takeFileName)
 import System.Process (readProcessWithExitCode)
 
 
-data TreeEntry = TreeEntry 
-    { mode :: String
+newtype Sha    = Sha    { unSha    :: String } deriving (Show, Eq)
+newtype Branch = Branch { unBranch :: String } deriving (Show, Eq)
+newtype Path   = Path   { unPath   :: String } deriving (Show, Eq, Ord)
+
+data TreeEntry = TreeEntry
+    { mode      :: String
     , entryType :: String
-    , sha :: String
-    , path :: String
+    , sha       :: Sha
+    , path      :: Path
     } deriving (Show)
+
+
+runGit :: [String] -> String -> IO String
+runGit args stdin = do
+    (code, stdout, stderr) <- readProcessWithExitCode "git" args stdin
+    putStr stderr
+    when (code /= ExitSuccess) exitFailure
+    return stdout
 
 
 main :: IO ()
@@ -25,10 +41,10 @@ main = do
     when (null paths) $ do
         putStrLn "error: no files specified"
         exitFailure
-    run branch paths
+    run (Branch branch) (map Path paths)
 
 
-run :: String -> [String] -> IO ()
+run :: Branch -> [Path] -> IO ()
 run branch paths = do
     exists <- doesBranchExist branch
     -- TODO: Handle existing branch?
@@ -38,64 +54,90 @@ run branch paths = do
     expandedPaths <- expandPaths paths
     shas          <- mapM hashFile expandedPaths
     tree          <- getTree
-    let finalTree  = buildTree expandedPaths shas tree
-    let treeInput  = unlines $ map formatTreeEntry finalTree
-    treeSha       <- mkTree treeInput
+    let pathShas   = zip expandedPaths shas
+        dirMap     = groupByDirectory tree
+    newShas       <- rebuildTrees dirMap pathShas
+    let treeSha    = Map.findWithDefault (Sha "") (Path ".") newShas
+
     commitSha     <- createCommit treeSha
     createBranch branch commitSha
     push branch
     restoreFiles expandedPaths tree
-    putStrLn $ "pushed branch: " ++ branch
+    putStrLn $ "pushed branch: " ++ unBranch branch
 
 
-doesBranchExist :: String -> IO Bool
-doesBranchExist branch = do
+doesBranchExist :: Branch -> IO Bool
+doesBranchExist (Branch branch) = do
     (code, _, _) <- readProcessWithExitCode "git" ["show-ref", "--verify", "refs/heads/" ++ branch] ""
     return $ code == ExitSuccess
 
 
-expandPaths :: [String] -> IO [String]
+expandPaths :: [Path] -> IO [Path]
 expandPaths paths = concat <$> mapM expandPath paths
 
 
-expandPath :: String -> IO [String]
-expandPath p = do
+expandPath :: Path -> IO [Path]
+expandPath (Path p) = do
     isDir <- doesDirectoryExist p
     if isDir
-        then expandPaths . map ((p ++ "/") ++) =<< listDirectory p
-        else return [p]
+        then expandPaths . map (Path . ((p ++ "/") ++)) =<< listDirectory p
+        else return [Path p]
 
 
-hashFile :: String -> IO String
-hashFile filePath = do
-    (_, stdout, _) <- readProcessWithExitCode "git" ["hash-object", "-w", filePath] ""
-    return $ head $ lines stdout
+hashFile :: Path -> IO Sha
+hashFile (Path filePath) = Sha . head . lines <$> runGit ["hash-object", "-w", filePath] ""
 
 
--- TODO (IMPORTANT): Support subdirectories
--- TODO: Investigate non-hardcoded origin/main
+-- TODO: Investigate non-hardcoded origin/master
 getTree :: IO [TreeEntry]
-getTree = do
-    (_, stdout, _) <- readProcessWithExitCode "git" ["ls-tree", "origin/main"] ""
-    return $ map parseTreeEntry $ lines stdout
+getTree = map parseTreeEntry . filter (not . null) . lines <$> runGit ["ls-tree", "-r", "origin/master"] ""
+
+
+groupByDirectory :: [TreeEntry] -> Map Path [TreeEntry]
+groupByDirectory = foldr insertEntry Map.empty
+  where
+    insertEntry entry acc =
+        let dir = Path . takeDirectory . unPath $ path entry
+        in Map.insertWith (++) dir [entry] acc
+
+
+
+updateSubtree :: Map Path Sha -> TreeEntry -> TreeEntry
+updateSubtree newShas entry =
+    case Map.lookup (path entry) newShas of
+        Just newSha -> entry { sha = newSha }
+        Nothing     -> entry
+
+
+rebuildTrees :: Map Path [TreeEntry] -> [(Path, Sha)] -> IO (Map Path Sha)
+rebuildTrees dirMap pathShas = foldM rebuildDir Map.empty dirs
+  where
+    dirs = sortBy (comparing (Down . length . filter (== '/') . unPath)) (Map.keys mergedMap)
+
+    newEntries = [ (Path . takeDirectory . unPath $ p, TreeEntry "100644" "blob" s p)
+                 | (p, s) <- pathShas
+                 , p `notElem` concatMap (map path) (Map.elems dirMap)
+                 ]
+
+    mergedMap = foldr (\(dir, e) acc -> Map.insertWith (++) dir [e] acc) dirMap newEntries
+
+    rebuildDir newShas dir = do
+        let entries             = Map.findWithDefault [] dir mergedMap
+            updated             = map (updateTreeEntry pathShas) entries
+            updatedWithSubtrees = map (updateSubtree newShas) updated
+            treeInput           = unlines $ map formatTreeEntry updatedWithSubtrees
+        newSha <- mkTree treeInput
+        return $ Map.insert dir newSha newShas
 
 
 parseTreeEntry :: String -> TreeEntry
 parseTreeEntry line =
     let (meta, tabPath) = break (== '\t') line
         [m, t, s]       = words meta
-    in TreeEntry m t s (drop 1 tabPath)
+    in TreeEntry m t (Sha s) (Path (drop 1 tabPath))
 
 
-buildTree :: [String] -> [String] -> [TreeEntry] -> [TreeEntry]
-buildTree paths shas tree = 
-    let pathShas    = zip paths shas
-        updatedTree = map (updateTreeEntry pathShas) tree
-        newEntries  = [TreeEntry "100644" "blob" s p | (p, s) <- pathShas, p `notElem` map path tree]
-    in updatedTree ++ newEntries
-
-
-updateTreeEntry :: [(String, String)] -> TreeEntry -> TreeEntry
+updateTreeEntry :: [(Path, Sha)] -> TreeEntry -> TreeEntry
 updateTreeEntry pathShas entry =
     case lookup (path entry) pathShas of
         Just newSha -> entry { sha = newSha }
@@ -103,44 +145,31 @@ updateTreeEntry pathShas entry =
 
 
 formatTreeEntry :: TreeEntry -> String
-formatTreeEntry e  = mode e ++ " " ++ entryType e ++ " " ++ sha e ++ "\t" ++ path e
+formatTreeEntry e = mode e ++ " " ++ entryType e ++ " " ++ unSha (sha e) ++ "\t" ++ takeFileName (unPath (path e))
 
 
-mkTree :: String -> IO String
-mkTree treeInput = do
-    (_, stdout, _) <- readProcessWithExitCode "git" ["mktree"] treeInput
-    return $ head $ lines stdout
+mkTree :: String -> IO Sha
+mkTree treeInput = Sha . head . lines <$> runGit ["mktree"] treeInput
 
 
-createCommit :: String -> IO String
-createCommit treeSha = do
-    -- TODO: Current default commit message is "." (my convention), can open to user input
-    (_, stdout, _) <- readProcessWithExitCode "git" ["commit-tree", treeSha, "-p", "origin/main", "-m", "."] ""
-    return $ head $ lines stdout
+-- TODO: Current default commit message is "." (my convention), can open to user input
+createCommit :: Sha -> IO Sha
+createCommit (Sha treeSha) = Sha . head . lines <$> runGit ["commit-tree", treeSha, "-p", "origin/master", "-m", "."] ""
 
 
-createBranch :: String -> String -> IO ()
-createBranch branch commitSha = do
-    (code, stdout, stderr) <- readProcessWithExitCode "git" ["update-ref", "refs/heads/" ++ branch, commitSha] ""
-    putStr stdout
-    putStr stderr
-    when (code /= ExitSuccess) exitFailure
+createBranch :: Branch -> Sha -> IO ()
+createBranch (Branch branch) (Sha commitSha) =
+    () <$ runGit ["update-ref", "refs/heads/" ++ branch, commitSha] ""
 
 
-push :: String -> IO ()
-push branch = do
-    (code, stdout, stderr) <- readProcessWithExitCode "git" ["push", "origin", branch] ""
-    putStr stdout
-    putStr stderr
-    when (code /= ExitSuccess) exitFailure
+push :: Branch -> IO ()
+push (Branch branch) = () <$ runGit ["push", "origin", branch] ""
 
 
-restoreFiles :: [String] -> [TreeEntry] -> IO ()
+restoreFiles :: [Path] -> [TreeEntry] -> IO ()
 restoreFiles paths tree = do
-    let existingPaths                = map path tree
-    let (newFiles, modifiedFiles)    = partition (`notElem` existingPaths) paths
-    mapM_ removeFile newFiles
-    when (not $ null modifiedFiles) $ do
-        (code, _, stderr) <- readProcessWithExitCode "git" (["checkout", "HEAD", "--"] ++ modifiedFiles) ""
-        putStr stderr
-        when (code /= ExitSuccess) exitFailure
+    let existingPaths             = map path tree
+    let (newFiles, modifiedFiles) = partition (`notElem` existingPaths) paths
+    mapM_ (removeFile . unPath) newFiles
+    when (not $ null modifiedFiles) $
+        () <$ runGit (["checkout", "HEAD", "--"] ++ map unPath modifiedFiles) ""

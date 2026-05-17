@@ -67,6 +67,8 @@ executable bonsai
     build-depends:    base ^>=4.18.3.0
                     , process
                     , directory
+                    , containers
+                    , filepath
 
     -- Directories containing source files.
     hs-source-dirs:   app

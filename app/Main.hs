@@ -1,5 +1,6 @@
 import Control.Monad (when)
-import System.Directory (doesDirectoryExist, listDirectory)
+import Data.List (partition)
+import System.Directory (doesDirectoryExist, listDirectory, removeFile)
 import System.Exit (ExitCode(..), exitFailure)
 import System.Environment (getArgs)
 import System.Process (readProcessWithExitCode)
@@ -43,6 +44,7 @@ run branch paths = do
     commitSha     <- createCommit treeSha
     createBranch branch commitSha
     push branch
+    restoreFiles expandedPaths tree
     putStrLn $ "pushed branch: " ++ branch
 
 
@@ -65,8 +67,8 @@ expandPath p = do
 
 
 hashFile :: String -> IO String
-hashFile path = do
-    (_, stdout, _) <- readProcessWithExitCode "git" ["hash-object", "-w", path] ""
+hashFile filePath = do
+    (_, stdout, _) <- readProcessWithExitCode "git" ["hash-object", "-w", filePath] ""
     return $ head $ lines stdout
 
 
@@ -131,3 +133,14 @@ push branch = do
     putStr stdout
     putStr stderr
     when (code /= ExitSuccess) exitFailure
+
+
+restoreFiles :: [String] -> [TreeEntry] -> IO ()
+restoreFiles paths tree = do
+    let existingPaths                = map path tree
+    let (newFiles, modifiedFiles)    = partition (`notElem` existingPaths) paths
+    mapM_ removeFile newFiles
+    when (not $ null modifiedFiles) $ do
+        (code, _, stderr) <- readProcessWithExitCode "git" (["checkout", "HEAD", "--"] ++ modifiedFiles) ""
+        putStr stderr
+        when (code /= ExitSuccess) exitFailure
